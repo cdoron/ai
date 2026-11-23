@@ -177,12 +177,14 @@ impl ConsultAdvisorFilter {
             .unwrap_or(false)
     }
 
-    /// Force `"stream": false` on a request body.
-    fn force_non_streaming_body(mut request: Value) -> Value {
+    /// Force `"stream": false` on a request body, then serialize it.
+    fn force_non_streaming_and_serialize(mut request: Value) -> Result<Bytes, FilterError> {
         if let Some(object) = request.as_object_mut() {
             object.insert("stream".to_owned(), Value::Bool(false));
         }
-        request
+        serde_json::to_vec(&request)
+            .map(Bytes::from)
+            .map_err(|error| FilterError::from(format!("{FILTER_NAME}: request serialization failed: {error}")))
     }
 
     /// Find a managed tool-use block anywhere in an assistant message's
@@ -217,15 +219,7 @@ impl ConsultAdvisorFilter {
     /// Messages response body.
     fn response_text(bytes: &[u8]) -> Option<String> {
         let response: Value = serde_json::from_slice(bytes).ok()?;
-        let text: String = response
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect();
-        Some(text)
+        Some(concat_text_blocks(response.get("content").and_then(Value::as_array)))
     }
 
     // -- executor role --------------------------------------------------
@@ -242,10 +236,7 @@ impl ConsultAdvisorFilter {
         let Ok(request) = serde_json::from_slice::<Value>(bytes) else {
             return Ok(FilterAction::Continue);
         };
-        let request = Self::force_non_streaming_body(request);
-        let rebuilt = serde_json::to_vec(&request)
-            .map_err(|error| FilterError::from(format!("{FILTER_NAME}: request serialization failed: {error}")))?;
-        *body = Some(Bytes::from(rebuilt));
+        *body = Some(Self::force_non_streaming_and_serialize(request)?);
         Self::force_buffered_transport(ctx);
         Ok(FilterAction::Continue)
     }
@@ -306,10 +297,7 @@ impl ConsultAdvisorFilter {
         body: &mut Option<Bytes>,
         request: Value,
     ) -> Result<FilterAction, FilterError> {
-        let request = Self::force_non_streaming_body(request);
-        let rebuilt = serde_json::to_vec(&request)
-            .map_err(|error| FilterError::from(format!("{FILTER_NAME}: request serialization failed: {error}")))?;
-        let rebuilt = Bytes::from(rebuilt);
+        let rebuilt = Self::force_non_streaming_and_serialize(request)?;
         Self::force_buffered_transport(ctx);
         let iteration_state = ctx.extensions.get_mut::<IterationState>().ok_or_else(|| {
             FilterError::from(format!(
@@ -442,14 +430,7 @@ struct TerminalAnswer {
 impl TerminalAnswer {
     /// Extract the fields needed to re-encode `response` as SSE.
     fn from_response(response: &Value) -> Self {
-        let text = response
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect();
+        let text = concat_text_blocks(response.get("content").and_then(Value::as_array));
         Self {
             id: response
                 .get("id")
@@ -466,6 +447,17 @@ impl TerminalAnswer {
             text,
         }
     }
+}
+
+/// Concatenate every `text` content block, treating an absent content
+/// array as having none.
+fn concat_text_blocks(content: Option<&Vec<Value>>) -> String {
+    content
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect()
 }
 
 /// Append the executor's assistant tool call and the advisor-answer user
