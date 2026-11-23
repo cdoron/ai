@@ -333,7 +333,8 @@ impl ConsultAdvisorFilter {
         };
         let Some(previous_response) = iteration_state.previous_response.as_ref() else {
             return Err(FilterError::from(format!(
-                "{FILTER_NAME}: previous IRR response unavailable while dispatching to the advisor"
+                "{FILTER_NAME}: role: advisor has no previous IRR response to consult from; it must never be \
+                 configured as the router's initial_step"
             )));
         };
         let Some((tool_use_id, question, assistant_content)) = self.managed_call_from_response(&previous_response.body)
