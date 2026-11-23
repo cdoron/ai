@@ -412,6 +412,66 @@ impl ConsultAdvisorFilter {
         let response: Value = serde_json::from_slice(bytes).ok()?;
         Some(render_sse_lifecycle(&TerminalAnswer::from_response(&response)))
     }
+
+    // -- response classification ------------------------------------------
+
+    /// Handle a non-2xx backend response for this round.
+    ///
+    /// The executor's own backend failure is passed through to the client
+    /// unchanged, as a reverse proxy normally would. The advisor backend is
+    /// an internal implementation detail of this filter, never the backend
+    /// the client asked for, so its failure is rejected with a clean error
+    /// instead of leaking an unrelated service's raw response to the
+    /// client as if it were the executor's own answer.
+    fn handle_backend_failure(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        match self.role {
+            Role::Executor => {
+                set_action(ctx, ACTION_DONE)?;
+                Ok(FilterAction::Continue)
+            },
+            Role::Advisor => Ok(FilterAction::Reject(wire::error_rejection(
+                502,
+                wire::ErrorType::Api,
+                &format!("{FILTER_NAME}: the advisor backend returned an error"),
+            ))),
+        }
+    }
+
+    /// Handle a successful executor response: consult the advisor if a
+    /// managed call is pending (rejecting an unanswerable parallel call),
+    /// otherwise the answer is terminal.
+    fn handle_executor_response(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(bytes) = body.as_deref() else {
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Continue);
+        };
+        if let Some((id, _, content)) = self.managed_call_from_response(bytes) {
+            if has_unanswerable_tool_use(&content, &id) {
+                return Ok(FilterAction::Reject(wire::error_rejection(
+                    502,
+                    wire::ErrorType::Api,
+                    &format!(
+                        "{FILTER_NAME}: the model called {} together with another tool_use block in the same \
+                         turn, which this filter cannot answer",
+                        self.tool_name
+                    ),
+                )));
+            }
+            set_action(ctx, ACTION_CONSULT)?;
+            return Ok(FilterAction::Continue);
+        }
+        set_action(ctx, ACTION_DONE)?;
+        if Self::original_wanted_streaming(ctx)
+            && let Some(sse) = Self::buffered_to_sse(bytes)
+        {
+            *body = Some(Bytes::from(sse));
+        }
+        Ok(FilterAction::Continue)
+    }
 }
 
 /// Fields of a buffered Messages response needed to re-encode it as SSE.
@@ -459,6 +519,20 @@ fn concat_text_blocks(content: Option<&Vec<Value>>) -> String {
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|block| block.get("text").and_then(Value::as_str))
         .collect()
+}
+
+/// Whether `content` contains a `tool_use` block other than `managed_id`.
+///
+/// The Anthropic Messages API requires a `tool_result` for every `tool_use`
+/// id in the preceding assistant turn before the next round; this filter
+/// only ever answers the one managed call, so any other `tool_use` block
+/// (a second managed call in parallel, or an unrelated client-handled tool)
+/// would leave an id unanswered and make the retained conversation invalid.
+fn has_unanswerable_tool_use(content: &[Value], managed_id: &str) -> bool {
+    content.iter().any(|block| {
+        block.get("type").and_then(Value::as_str) == Some("tool_use")
+            && block.get("id").and_then(Value::as_str) != Some(managed_id)
+    })
 }
 
 /// Append the executor's assistant tool call and the advisor-answer user
@@ -625,10 +699,15 @@ impl HttpFilter for ConsultAdvisorFilter {
         // Only the executor role's terminal round is ever externally
         // visible (the IRR discards every looping/transitioning round
         // before it reaches the client), so unconditionally overriding
-        // Content-Type here on every executor round is safe and correctly
-        // applies to whichever round ends up terminal. The advisor's own
-        // round is never externally visible at all.
+        // Content-Type here on every successful executor round is safe and
+        // correctly applies to whichever round ends up terminal. A failed
+        // round's body is never re-encoded as SSE in on_response_body, so
+        // its Content-Type must not be rewritten here either, or a
+        // streaming client would receive a plain-JSON error body mislabeled
+        // as `text/event-stream`. The advisor's own round is never
+        // externally visible at all.
         if self.role == Role::Executor
+            && is_success_response(ctx)
             && Self::original_wanted_streaming(ctx)
             && let Some(response) = ctx.response_header.as_mut()
         {
@@ -649,27 +728,10 @@ impl HttpFilter for ConsultAdvisorFilter {
             return Ok(FilterAction::Continue);
         }
         if !is_success_response(ctx) {
-            set_action(ctx, ACTION_DONE)?;
-            return Ok(FilterAction::Continue);
+            return self.handle_backend_failure(ctx);
         }
         match self.role {
-            Role::Executor => {
-                let Some(bytes) = body.as_deref() else {
-                    set_action(ctx, ACTION_DONE)?;
-                    return Ok(FilterAction::Continue);
-                };
-                if self.managed_call_from_response(bytes).is_some() {
-                    set_action(ctx, ACTION_CONSULT)?;
-                    return Ok(FilterAction::Continue);
-                }
-                set_action(ctx, ACTION_DONE)?;
-                if Self::original_wanted_streaming(ctx)
-                    && let Some(sse) = Self::buffered_to_sse(bytes)
-                {
-                    *body = Some(Bytes::from(sse));
-                }
-                Ok(FilterAction::Continue)
-            },
+            Role::Executor => self.handle_executor_response(ctx, body),
             Role::Advisor => {
                 set_action(ctx, ACTION_FOLD_BACK)?;
                 Ok(FilterAction::Continue)
@@ -698,9 +760,12 @@ mod tests {
     #[test]
     fn from_config_rejects_advisor_role_without_target_model() {
         let yaml = serde_yaml::from_str("role: advisor").unwrap();
-        let Err(error) = ConsultAdvisorFilter::from_config(&yaml) else {
-            panic!("expected an error when target_model is missing for role: advisor");
-        };
+        let result = ConsultAdvisorFilter::from_config(&yaml);
+        assert!(
+            result.is_err(),
+            "expected an error when target_model is missing for role: advisor"
+        );
+        let error = result.err().expect("checked above");
         assert!(error.to_string().contains("target_model"));
     }
 
@@ -735,6 +800,24 @@ mod tests {
     }
 
     #[test]
+    fn has_unanswerable_tool_use_ignores_the_managed_call_itself() {
+        let content = vec![
+            json!({"type": "text", "text": "Let me ask for advice."}),
+            json!({"type": "tool_use", "id": "toolu_1", "name": "ConsultAdvisor", "input": {"question": "?"}}),
+        ];
+        assert!(!has_unanswerable_tool_use(&content, "toolu_1"));
+    }
+
+    #[test]
+    fn has_unanswerable_tool_use_detects_a_second_tool_use_block() {
+        let content = vec![
+            json!({"type": "tool_use", "id": "toolu_1", "name": "ConsultAdvisor", "input": {"question": "?"}}),
+            json!({"type": "tool_use", "id": "toolu_2", "name": "SomeOtherTool", "input": {}}),
+        ];
+        assert!(has_unanswerable_tool_use(&content, "toolu_1"));
+    }
+
+    #[test]
     fn response_text_concatenates_text_blocks() {
         let body = json!({"content": [{"type": "text", "text": "Yes, "}, {"type": "text", "text": "it is safe."}]});
         let bytes = serde_json::to_vec(&body).unwrap();
@@ -753,8 +836,18 @@ mod tests {
         append_consult_turns(&mut request, &pending, "Yes, it is safe.").unwrap();
         let messages = request.get("messages").and_then(Value::as_array).unwrap();
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1].get("role").and_then(Value::as_str), Some("assistant"));
-        let tool_result = &messages[2]["content"][0];
+        assert_eq!(
+            messages
+                .get(1)
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str),
+            Some("assistant")
+        );
+        let tool_result = messages
+            .get(2)
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.get(0))
+            .expect("tool_result content block");
         assert_eq!(tool_result.get("tool_use_id").and_then(Value::as_str), Some("toolu_1"));
         assert_eq!(
             tool_result.get("content").and_then(Value::as_str),
