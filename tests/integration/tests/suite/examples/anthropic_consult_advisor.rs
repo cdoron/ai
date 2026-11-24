@@ -134,9 +134,20 @@ fn consult_advisor_round_trip_folds_advisor_answer_into_executor_response() {
     let advisor_requests = advisor.requests();
     assert_eq!(advisor_requests.len(), 1, "exactly one advisor callout");
     let advisor_body: Value = serde_json::from_str(&advisor_requests[0].body).expect("parse advisor request body");
-    assert_eq!(
-        advisor_body["messages"][0]["content"][0]["text"], "Is it safe to run rm -rf / in production?",
+    let advisor_text = advisor_body["messages"][0]["content"][0]["text"]
+        .as_str()
+        .expect("advisor user text");
+    assert!(
+        advisor_text.contains("Is it safe to run rm -rf / in production?"),
         "the advisor receives the tool's question: {advisor_body}"
+    );
+    assert!(
+        advisor_text.contains("Ask the advisor whether it is safe to run rm -rf / in production."),
+        "the advisor also receives the client's original conversation, not just the tool's question: {advisor_body}"
+    );
+    assert!(
+        advisor_body.get("system").and_then(Value::as_str).is_some(),
+        "the advisor request carries a system prompt: {advisor_body}"
     );
 
     let executor_requests = executor.requests();

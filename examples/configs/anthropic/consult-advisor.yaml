@@ -12,8 +12,12 @@
 #     detects the managed tool call and, later, folds the advisor's
 #     answer back into the retained conversation.
 #   * `role: advisor`, placed in the step that runs the advisor model:
-#     builds a one-shot request to `target_model` from the tool's
-#     `question` input, and always transitions back.
+#     builds a one-shot request to `target_model` carrying both the
+#     tool's `question` input and the executor's whole retained
+#     conversation so far (not just the question), under a default
+#     system prompt that frames the advisor as a strategic advisor for
+#     a coding agent (override with `system_prompt`), and always
+#     transitions back.
 #
 # Like `where_is_treasure`, every round is forced to the buffered
 # subrequest transport regardless of the client's requested `stream`
@@ -74,7 +78,9 @@ filter_chains:
                 role: advisor
                 tool_name: ConsultAdvisor
                 target_model: "advisor-model"
-                system_prompt: "You are a careful advisor. Answer the question concisely in one or two sentences."
+                # system_prompt omitted: uses the filter's built-in default,
+                # framing the advisor as a strategic advisor for a coding
+                # agent. Set system_prompt here to override it.
                 advisor_max_tokens: 512
 
               - filter: router

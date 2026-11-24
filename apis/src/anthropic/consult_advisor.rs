@@ -14,6 +14,14 @@
 //! model. `IterationState.accumulator` carries the pending tool-call id
 //! and the executor's assistant turn across the step transition and back.
 //!
+//! The advisor is given the whole conversation, not just the tool call's
+//! `question` argument: its one-shot request carries the executor's
+//! retained conversation so far (including the tool-calling turn) as
+//! background evidence alongside the question, under a system prompt
+//! that frames the advisor as a strategic advisor for a coding agent
+//! ([`DEFAULT_SYSTEM_PROMPT`], overridable per instance via
+//! `system_prompt`).
+//!
 //! As with `where_is_treasure`, the executor's own rounds are forced to
 //! the buffered subrequest transport regardless of the client's
 //! requested `stream` value, and the terminal (non-looping) answer is
@@ -50,6 +58,11 @@ const PENDING_ACCUMULATOR_KEY: &str = "consult_advisor.pending";
 const DEFAULT_TOOL_NAME: &str = "ConsultAdvisor";
 /// Default `max_tokens` for the advisor's one-shot request.
 const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 1024;
+/// Default advisor system prompt, used unless an instance's `system_prompt`
+/// overrides it. Frames the advisor as a strategic advisor for a coding
+/// agent, given the agent's full session as evidence for a one-shot,
+/// non-interactive consultation.
+const DEFAULT_SYSTEM_PROMPT: &str = include_str!("consult_advisor_system_prompt.txt");
 
 /// Default maximum body size (1 MiB).
 fn default_max_body_bytes() -> usize {
@@ -86,8 +99,9 @@ struct ConsultAdvisorConfig {
     /// Model name sent in the advisor's own request body. Required for
     /// `role: advisor`.
     target_model: Option<String>,
-    /// Optional system prompt for the advisor's one-shot request.
-    /// Only meaningful for `role: advisor`.
+    /// Override for the advisor's system prompt. Defaults to
+    /// [`DEFAULT_SYSTEM_PROMPT`] when unset. Only meaningful for
+    /// `role: advisor`.
     system_prompt: Option<String>,
     /// `max_tokens` for the advisor's one-shot request. Only meaningful
     /// for `role: advisor`.
@@ -118,7 +132,8 @@ pub struct ConsultAdvisorFilter {
     tool_name: String,
     /// Model name sent in the advisor's own request body.
     target_model: Option<String>,
-    /// Optional system prompt for the advisor's one-shot request.
+    /// Override for the advisor's system prompt. Defaults to
+    /// [`DEFAULT_SYSTEM_PROMPT`] when unset.
     system_prompt: Option<String>,
     /// `max_tokens` for the advisor's one-shot request.
     advisor_max_tokens: u32,
@@ -344,33 +359,53 @@ impl ConsultAdvisorFilter {
                 self.tool_name
             )));
         };
+        let context = Self::advisor_context(iteration_state, &assistant_content)?;
         let pending = PendingConsult {
             tool_use_id,
             assistant_content,
         };
-        let rebuilt = self.build_advisor_request(&question)?;
+        let rebuilt = self.build_advisor_request(&question, &context)?;
         Self::force_buffered_transport(ctx);
         Self::commit_advisor_dispatch(ctx, body, &pending, rebuilt)
     }
 
-    /// Build the advisor's one-shot request body for `question`.
-    fn build_advisor_request(&self, question: &str) -> Result<Bytes, FilterError> {
+    /// Serialize the executor's retained conversation so far, plus its
+    /// latest (tool-calling) turn, as JSON text: background evidence for
+    /// the advisor, so it sees more than just the tool call's `question`.
+    fn advisor_context(iteration_state: &IterationState, assistant_content: &[Value]) -> Result<String, FilterError> {
+        let request_bytes = iteration_state
+            .accumulator
+            .get(REQUEST_ACCUMULATOR_KEY)
+            .unwrap_or(&iteration_state.original_request.body);
+        let request: Value = serde_json::from_slice(request_bytes)
+            .map_err(|error| FilterError::from(format!("{FILTER_NAME}: retained request parsing failed: {error}")))?;
+        let mut messages = request
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        messages.push(json!({"role": "assistant", "content": assistant_content}));
+        serde_json::to_string(&messages)
+            .map_err(|error| FilterError::from(format!("{FILTER_NAME}: advisor context serialization failed: {error}")))
+    }
+
+    /// Build the advisor's one-shot request body: `question` is the tool
+    /// call's own argument, `context` is the serialized conversation so
+    /// far from [`Self::advisor_context`].
+    fn build_advisor_request(&self, question: &str, context: &str) -> Result<Bytes, FilterError> {
         let Some(target_model) = self.target_model.as_deref() else {
             return Err(FilterError::from(format!(
                 "{FILTER_NAME}: 'target_model' missing for role: advisor"
             )));
         };
-        let mut advisor_request = json!({
+        let user_text = format!("Advisory request: {question}\n\nExecutor context and reasoning so far:\n{context}");
+        let advisor_request = json!({
             "model": target_model,
             "max_tokens": self.advisor_max_tokens,
             "stream": false,
-            "messages": [{"role": "user", "content": [{"type": "text", "text": question}]}],
+            "system": self.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT),
+            "messages": [{"role": "user", "content": [{"type": "text", "text": user_text}]}],
         });
-        if let Some(system_prompt) = &self.system_prompt
-            && let Some(object) = advisor_request.as_object_mut()
-        {
-            object.insert("system".to_owned(), Value::String(system_prompt.clone()));
-        }
         let rebuilt = serde_json::to_vec(&advisor_request).map_err(|error| {
             FilterError::from(format!("{FILTER_NAME}: advisor request serialization failed: {error}"))
         })?;
@@ -757,6 +792,17 @@ mod tests {
         }
     }
 
+    fn advisor_filter(system_prompt: Option<String>) -> ConsultAdvisorFilter {
+        ConsultAdvisorFilter {
+            role: Role::Advisor,
+            tool_name: DEFAULT_TOOL_NAME.to_owned(),
+            target_model: Some("advisor-model".to_owned()),
+            system_prompt,
+            advisor_max_tokens: DEFAULT_ADVISOR_MAX_TOKENS,
+            max_body_bytes: default_max_body_bytes(),
+        }
+    }
+
     #[test]
     fn from_config_rejects_advisor_role_without_target_model() {
         let yaml = serde_yaml::from_str("role: advisor").unwrap();
@@ -853,6 +899,49 @@ mod tests {
             tool_result.get("content").and_then(Value::as_str),
             Some("Yes, it is safe.")
         );
+    }
+
+    #[test]
+    fn build_advisor_request_defaults_system_prompt_when_unconfigured() {
+        let bytes = advisor_filter(None)
+            .build_advisor_request("Is this safe?", "[]")
+            .unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            request.get("system").and_then(Value::as_str),
+            Some(DEFAULT_SYSTEM_PROMPT)
+        );
+    }
+
+    #[test]
+    fn build_advisor_request_honors_configured_system_prompt_override() {
+        let bytes = advisor_filter(Some("Custom advisor prompt".to_owned()))
+            .build_advisor_request("Is this safe?", "[]")
+            .unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            request.get("system").and_then(Value::as_str),
+            Some("Custom advisor prompt")
+        );
+    }
+
+    #[test]
+    fn build_advisor_request_embeds_question_and_context_in_user_text() {
+        let context = r#"[{"role":"user","content":[{"type":"text","text":"original question"}]}]"#;
+        let bytes = advisor_filter(None)
+            .build_advisor_request("Is this safe?", context)
+            .unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = request
+            .get("messages")
+            .and_then(|messages| messages.get(0))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.get(0))
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+            .expect("advisor user text");
+        assert!(text.contains("Advisory request: Is this safe?"), "{text}");
+        assert!(text.contains("original question"), "{text}");
     }
 
     #[test]
