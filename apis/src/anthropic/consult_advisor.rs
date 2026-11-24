@@ -20,7 +20,10 @@
 //! background evidence alongside the question, under a system prompt
 //! that frames the advisor as a strategic advisor for a coding agent
 //! ([`DEFAULT_SYSTEM_PROMPT`], overridable per instance via
-//! `system_prompt`).
+//! `system_prompt`). `question` is optional on the tool's input schema:
+//! the conversation is forwarded either way, so a model that wants a
+//! general check-in rather than a specific answer can omit it and fall
+//! back to [`DEFAULT_ADVISORY_REQUEST`].
 //!
 //! As with `where_is_treasure`, the executor's own rounds are forced to
 //! the buffered subrequest transport regardless of the client's
@@ -63,6 +66,11 @@ const DEFAULT_ADVISOR_MAX_TOKENS: u32 = 1024;
 /// agent, given the agent's full session as evidence for a one-shot,
 /// non-interactive consultation.
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("consult_advisor_system_prompt.txt");
+/// Fallback advisory request used when the model calls the managed tool
+/// without a `question` input. The forwarded conversation is the same
+/// either way, so a generic request still gives the advisor a clear task.
+const DEFAULT_ADVISORY_REQUEST: &str =
+    "Review the executor's current progress and provide concise, actionable guidance.";
 
 /// Default maximum body size (1 MiB).
 fn default_max_body_bytes() -> usize {
@@ -203,10 +211,12 @@ impl ConsultAdvisorFilter {
     }
 
     /// Find a managed tool-use block anywhere in an assistant message's
-    /// content and return its `id`, the question from `input.question`,
-    /// and the complete content array (so any preceding text blocks are
-    /// preserved verbatim in the next round's conversation history).
-    fn managed_call_from_response(&self, bytes: &[u8]) -> Option<(String, String, Vec<Value>)> {
+    /// content and return its `id`, the question from `input.question`
+    /// when the model supplied one (the argument is optional: the whole
+    /// conversation is forwarded to the advisor regardless), and the
+    /// complete content array (so any preceding text blocks are preserved
+    /// verbatim in the next round's conversation history).
+    fn managed_call_from_response(&self, bytes: &[u8]) -> Option<(String, Option<String>, Vec<Value>)> {
         let response: Value = serde_json::from_slice(bytes).ok()?;
         if response.get("type").and_then(Value::as_str) != Some("message") {
             return None;
@@ -226,8 +236,9 @@ impl ConsultAdvisorFilter {
         let question = tool_use
             .get("input")
             .and_then(|input| input.get("question"))
-            .and_then(Value::as_str)?;
-        Some((id.to_owned(), question.to_owned(), content.clone()))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Some((id.to_owned(), question, content.clone()))
     }
 
     /// Concatenate every `text` content block in a buffered Anthropic
@@ -360,6 +371,7 @@ impl ConsultAdvisorFilter {
             )));
         };
         let context = Self::advisor_context(iteration_state, &assistant_content)?;
+        let question = question.unwrap_or_else(|| DEFAULT_ADVISORY_REQUEST.to_owned());
         let pending = PendingConsult {
             tool_use_id,
             assistant_content,
@@ -830,8 +842,23 @@ mod tests {
             .managed_call_from_response(&bytes)
             .expect("managed call");
         assert_eq!(id, "toolu_1");
-        assert_eq!(question, "Is this safe?");
+        assert_eq!(question, Some("Is this safe?".to_owned()));
         assert_eq!(content.len(), 2);
+    }
+
+    #[test]
+    fn finds_managed_call_with_no_question_input() {
+        let body = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "ConsultAdvisor", "input": {}}],
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let (id, question, _content) = executor_filter()
+            .managed_call_from_response(&bytes)
+            .expect("the call is still detected without a question input");
+        assert_eq!(id, "toolu_1");
+        assert_eq!(question, None);
     }
 
     #[test]

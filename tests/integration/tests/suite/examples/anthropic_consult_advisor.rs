@@ -47,7 +47,7 @@ fn client_request() -> Value {
         "tools": [{
             "name": "ConsultAdvisor",
             "description": "Ask a second expert model for advice before answering a risky question.",
-            "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+            "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}},
         }],
     })
 }
@@ -60,6 +60,21 @@ fn executor_tool_call_round(tool_use_id: &str, question: &str) -> String {
         "role": "assistant",
         "model": "executor-model",
         "content": [{"type": "tool_use", "id": tool_use_id, "name": "ConsultAdvisor", "input": {"question": question}}],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    })
+    .to_string()
+}
+
+/// An executor round that calls the managed `ConsultAdvisor` tool without a
+/// `question` input, exercising the fallback generic advisory request.
+fn executor_tool_call_round_without_question(tool_use_id: &str) -> String {
+    json!({
+        "id": "msg_round0",
+        "type": "message",
+        "role": "assistant",
+        "model": "executor-model",
+        "content": [{"type": "tool_use", "id": tool_use_id, "name": "ConsultAdvisor", "input": {}}],
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 10, "output_tokens": 5},
     })
@@ -168,6 +183,38 @@ fn consult_advisor_round_trip_folds_advisor_answer_into_executor_response() {
     assert_eq!(
         tool_result["content"][0]["content"], "No, that would destroy the filesystem.",
         "the fold-back carries the advisor's answer text: {tool_result}"
+    );
+}
+
+#[test]
+fn consult_advisor_without_a_question_falls_back_to_a_generic_request() {
+    let executor = StatefulCapturingBackend::new(vec![
+        (200, executor_tool_call_round_without_question("toolu_1")),
+        (200, executor_answer_round("Looks fine so far.")),
+    ])
+    .start_with_shutdown();
+    let advisor =
+        StatefulCapturingBackend::new(vec![(200, advisor_answer_round("Looks fine so far."))]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_config(proxy_port, executor.port(), advisor.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &client_request().to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "round trip should succeed: {raw}");
+    let advisor_requests = advisor.requests();
+    assert_eq!(advisor_requests.len(), 1, "exactly one advisor callout");
+    let advisor_body: Value = serde_json::from_str(&advisor_requests[0].body).expect("parse advisor request body");
+    let advisor_text = advisor_body["messages"][0]["content"][0]["text"]
+        .as_str()
+        .expect("advisor user text");
+    assert!(
+        advisor_text.contains("Review the executor's current progress and provide concise, actionable guidance."),
+        "a tool call without a question falls back to the generic advisory request: {advisor_body}"
+    );
+    assert!(
+        advisor_text.contains("Ask the advisor whether it is safe to run rm -rf / in production."),
+        "the full conversation is still forwarded even without a question: {advisor_body}"
     );
 }
 
