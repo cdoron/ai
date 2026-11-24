@@ -1,0 +1,108 @@
+# ConsultAdvisor — a two-step server-owned tool
+#
+# Demonstrates a managed tool whose answer comes from a second, genuinely
+# separate inference backend rather than a fixed string or an external API
+# call: when the executor model calls the managed tool, `consult_advisor`
+# transitions the iterative_request_router to a second named step that
+# consults an advisor model, then folds the advisor's answer back into the
+# executor's conversation as a `tool_result` and transitions back.
+#
+# One filter type, two configured instances:
+#   * `role: executor`, placed in the step that runs the main model:
+#     detects the managed tool call and, later, folds the advisor's
+#     answer back into the retained conversation.
+#   * `role: advisor`, placed in the step that runs the advisor model:
+#     builds a one-shot request to `target_model` carrying both the
+#     tool's `question` input and the executor's whole retained
+#     conversation so far (not just the question), under a default
+#     system prompt that frames the advisor as a strategic advisor for
+#     a coding agent (override with `system_prompt`), and always
+#     transitions back. `question` is optional on the tool's own input
+#     schema: the conversation is forwarded either way, so a call
+#     without one (a general check-in rather than a specific ask) still
+#     reaches the advisor, just with a generic fallback request instead
+#     of the model's own wording.
+#
+# Like `where_is_treasure`, every round is forced to the buffered
+# subrequest transport regardless of the client's requested `stream`
+# value, and the executor's terminal (non-looping) answer is re-encoded as
+# a single Anthropic Messages SSE lifecycle when the client asked to
+# stream. The advisor's own round is never directly client-visible, so it
+# needs none of that.
+#
+# cargo run -p praxis-ai-proxy -- -c examples/configs/anthropic/consult-advisor.yaml
+#
+# curl http://127.0.0.1:8080/v1/messages \
+#   -H 'content-type: application/json' \
+#   -d '{"model":"claude-x","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"Use the ConsultAdvisor tool to ask whether it is safe to run rm -rf / on a production server, then tell me what the advisor said."}]}],"tools":[{"name":"ConsultAdvisor","description":"Ask a second expert model for advice before answering a risky or uncertain question.","input_schema":{"type":"object","properties":{"question":{"type":"string"}}}}]}'
+
+listeners:
+  - name: anthropic-advisor
+    address: "127.0.0.1:8080"
+    filter_chains: [advisor-tool]
+
+filter_chains:
+  - name: advisor-tool
+    filters:
+      - filter: anthropic_messages_request
+        on_invalid: reject
+
+      - filter: router
+        routes:
+          - path_prefix: "/v1/messages"
+            cluster: "executor-backend"
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 90000
+        steps:
+          - name: inference
+            filters:
+              - filter: consult_advisor
+                role: executor
+                tool_name: ConsultAdvisor
+
+              - filter: load_balancer
+                cluster_source: bound_upstream
+                clusters:
+                  - name: "executor-backend"
+                    endpoints: ["127.0.0.1:8000"]
+            on_result:
+              - filter: consult_advisor
+                key: action
+                value: consult
+                next: advisor
+              - default: true
+                done: true
+
+          - name: advisor
+            filters:
+              - filter: consult_advisor
+                role: advisor
+                tool_name: ConsultAdvisor
+                target_model: "advisor-model"
+                # system_prompt omitted: uses the filter's built-in default,
+                # framing the advisor as a strategic advisor for a coding
+                # agent. Set system_prompt here to override it.
+                advisor_max_tokens: 512
+
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "advisor-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "advisor-backend"
+                    endpoints: ["127.0.0.1:8001"]
+            on_result:
+              - filter: consult_advisor
+                key: action
+                value: fold_back
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

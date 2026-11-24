@@ -92,6 +92,7 @@ for how these are authored and regenerated.
 
 | File | Description |
 | ------ | ------------- |
+| [consult-advisor.yaml](configs/anthropic/consult-advisor.yaml) | A two-step server-owned tool: the executor model's managed tool call transitions the IRR to a second step that consults a genuinely separate advisor model, folding its answer back into the executor's conversation as a tool_result |
 | [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR), serves BOTH streaming and buffered clients from one pipeline, and adapts to BOTH backend wire formats from one config |
 | [messages-native-vllm.yaml](configs/anthropic/messages-native-vllm.yaml) | Routes native Anthropic Messages API traffic (`/v1/messages` and `/v1/messages/count_tokens`) to a vLLM backend that natively serves the Anthropic Messages API, WITHOUT any request or response body translation |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |

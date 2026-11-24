@@ -9,6 +9,7 @@ mod test_utils;
 pub use test_utils::load_example_config;
 
 mod agentic_routing;
+mod anthropic_consult_advisor;
 mod anthropic_full_flow_agentic;
 mod anthropic_full_flow_agentic_chat;
 #[cfg(feature = "openai-responses")]
